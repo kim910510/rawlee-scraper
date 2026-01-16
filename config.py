@@ -37,14 +37,21 @@ CSV_HEADERS = [
 # DISTRIBUTED MODE SETTINGS
 # =============================================================================
 
-def _generate_stable_node_id():
-    """Generate stable Node ID based on hostname (same across restarts)"""
-    hostname = socket.gethostname()
-    # Use first 8 chars of hostname hash for uniqueness
-    host_hash = hashlib.md5(hostname.encode()).hexdigest()[:8]
-    return f"node-{hostname[:12]}-{host_hash}"
+def _get_external_ip():
+    """Get external IP address (with fallback)"""
+    import urllib.request
+    try:
+        return urllib.request.urlopen('https://api.ipify.org', timeout=3).read().decode('utf-8')
+    except:
+        return socket.gethostname()[:15]
 
-# Node identification - STABLE across restarts (based on hostname)
+def _generate_stable_node_id():
+    """Generate stable Node ID with IP for easy identification"""
+    ip = _get_external_ip()
+    host_hash = hashlib.md5(ip.encode()).hexdigest()[:4]
+    return f"node-{ip}-{host_hash}"
+
+# Node identification - includes IP for easy identification
 NODE_ID = os.environ.get("SCRAPER_NODE_ID", _generate_stable_node_id())
 
 # Redis settings for central deduplication
