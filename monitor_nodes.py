@@ -2,6 +2,8 @@
 """
 Node Monitor - View status of all distributed scraper nodes
 Connects to Redis and displays real-time stats from all nodes
+- Only shows ACTIVE nodes (filters out offline/stale)
+- Total Unique from Redis (accurate cross-node dedup count)
 """
 
 import time
@@ -23,6 +25,9 @@ REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
 
 REDIS_SEEN_IDS_KEY = "scraper:seen_ids"
 REDIS_NODE_STATUS_KEY = "scraper:nodes"
+
+# Node timeout - only show nodes updated within this time
+NODE_TIMEOUT = 60  # seconds
 
 
 def format_time(seconds: float) -> str:
@@ -50,13 +55,9 @@ def main():
         print(f"❌ Connection failed: {e}")
         sys.exit(1)
     
-    print("=" * 80)
-    print("📊 Distributed Scraper Monitor - Press Ctrl+C to exit")
-    print("=" * 80)
-    
     try:
         while True:
-            # Get total unique IDs
+            # Get total unique IDs from Redis (accurate count)
             total_ids = client.scard(REDIS_SEEN_IDS_KEY)
             
             # Get all node statuses
@@ -65,14 +66,15 @@ def main():
             # Clear screen
             os.system('clear' if os.name != 'nt' else 'cls')
             
-            print("=" * 80)
-            print(f"📊 Distributed Scraper Monitor | Total Unique: {total_ids:,}")
-            print("=" * 80)
-            print(f"{'Node ID':<20} {'Unique':>10} {'Rate':>10} {'Dup%':>8} {'Batch':>6} {'Elapsed':>10} {'Status':>10}")
-            print("-" * 80)
+            print("=" * 85)
+            print(f"📊 Distributed Scraper Monitor | Redis Total Unique: {total_ids:,}")
+            print("=" * 85)
+            print(f"{'Node ID':<25} {'Unique':>10} {'Rate':>10} {'Dup%':>8} {'Batch':>6} {'Elapsed':>10} {'Status':>10}")
+            print("-" * 85)
             
             total_rate = 0
             active_nodes = 0
+            stale_to_delete = []
             
             for node_id, status_json in sorted(nodes.items()):
                 try:
@@ -80,16 +82,19 @@ def main():
                     last_update = stats.get('last_update', 0)
                     age = time.time() - last_update
                     
-                    if age > 60:
-                        status = "⚪ Offline"
-                    elif age > 30:
-                        status = "🟡 Stale"
-                    else:
-                        status = "🟢 Active"
-                        active_nodes += 1
-                        total_rate += stats.get('rate', 0)
+                    # Skip offline nodes (not updated in NODE_TIMEOUT seconds)
+                    if age > NODE_TIMEOUT:
+                        # Mark for cleanup if very old (> 5 minutes)
+                        if age > 300:
+                            stale_to_delete.append(node_id)
+                        continue  # Don't display offline nodes
                     
-                    print(f"{node_id:<20} "
+                    # Active node
+                    active_nodes += 1
+                    total_rate += stats.get('rate', 0)
+                    status = "🟢 Active"
+                    
+                    print(f"{node_id:<25} "
                           f"{stats.get('unique', 0):>10,} "
                           f"{stats.get('rate', 0):>9.1f}/s "
                           f"{stats.get('dup_ratio', 0)*100:>7.1f}% "
@@ -97,15 +102,19 @@ def main():
                           f"{format_time(stats.get('elapsed', 0)):>10} "
                           f"{status:>10}")
                 except:
-                    print(f"{node_id:<20} {'Error parsing status':>60}")
+                    pass
             
-            if not nodes:
-                print(f"{'No active nodes':^80}")
+            # Clean up very stale nodes
+            for node_id in stale_to_delete:
+                client.hdel(REDIS_NODE_STATUS_KEY, node_id)
             
-            print("-" * 80)
-            print(f"{'TOTAL':<20} {total_ids:>10,} {total_rate:>9.1f}/s {'':>8} {'':>6} {'':>10} {f'{active_nodes} nodes':>10}")
-            print("=" * 80)
-            print("\nRefreshing every 5 seconds... Press Ctrl+C to exit")
+            if active_nodes == 0:
+                print(f"{'No active nodes':^85}")
+            
+            print("-" * 85)
+            print(f"{'TOTAL':<25} {total_ids:>10,} {total_rate:>9.1f}/s {'':>8} {'':>6} {'':>10} {f'{active_nodes} nodes':>10}")
+            print("=" * 85)
+            print(f"\n⏰ Only showing nodes active in last {NODE_TIMEOUT}s | Refreshing every 5s | Ctrl+C to exit")
             
             time.sleep(5)
             

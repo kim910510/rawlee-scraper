@@ -69,18 +69,24 @@ class RedisDedup:
     
     async def is_seen(self, product_id: str) -> bool:
         if not self.connected:
+            await self._try_reconnect()
+        if not self.connected:
             return False
         try:
             return await self.client.sismember(REDIS_SEEN_IDS_KEY, product_id)
-        except:
+        except Exception:
+            await self._try_reconnect()
             return False
     
     async def add_seen(self, product_id: str) -> bool:
         if not self.connected:
+            await self._try_reconnect()
+        if not self.connected:
             return False
         try:
             return await self.client.sadd(REDIS_SEEN_IDS_KEY, product_id) == 1
-        except:
+        except Exception:
+            await self._try_reconnect()
             return False
     
     async def add_seen_batch(self, product_ids: list) -> int:
@@ -88,7 +94,8 @@ class RedisDedup:
             return 0
         try:
             return await self.client.sadd(REDIS_SEEN_IDS_KEY, *product_ids)
-        except:
+        except Exception:
+            await self._try_reconnect()
             return 0
     
     async def get_count(self) -> int:
@@ -96,16 +103,29 @@ class RedisDedup:
             return 0
         try:
             return await self.client.scard(REDIS_SEEN_IDS_KEY)
-        except:
+        except Exception:
+            await self._try_reconnect()
             return 0
     
     async def update_node_status(self, stats: dict):
+        if not self.connected:
+            await self._try_reconnect()
         if not self.connected:
             return
         try:
             stats['last_update'] = time.time()
             await self.client.hset(REDIS_NODE_STATUS_KEY, NODE_ID, json.dumps(stats))
             await self.client.expire(REDIS_NODE_STATUS_KEY, 300)
+        except Exception:
+            await self._try_reconnect()
+    
+    async def _try_reconnect(self):
+        """Try to reconnect to Redis if disconnected"""
+        if self.connected:
+            return
+        try:
+            logger.info("🔄 Attempting Redis reconnection...")
+            await self.connect()
         except:
             pass
 

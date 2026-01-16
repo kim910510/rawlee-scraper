@@ -2,7 +2,8 @@
 Crawlee Scraper Configuration - Distributed Mode
 """
 import os
-import uuid
+import socket
+import hashlib
 
 # Target API
 BASE_URL = "https://filovesk.click/api/item/type"
@@ -36,11 +37,17 @@ CSV_HEADERS = [
 # DISTRIBUTED MODE SETTINGS
 # =============================================================================
 
-# Node identification (auto-generated if not set)
-NODE_ID = os.environ.get("SCRAPER_NODE_ID", f"node-{uuid.uuid4().hex[:8]}")
+def _generate_stable_node_id():
+    """Generate stable Node ID based on hostname (same across restarts)"""
+    hostname = socket.gethostname()
+    # Use first 8 chars of hostname hash for uniqueness
+    host_hash = hashlib.md5(hostname.encode()).hexdigest()[:8]
+    return f"node-{hostname[:12]}-{host_hash}"
+
+# Node identification - STABLE across restarts (based on hostname)
+NODE_ID = os.environ.get("SCRAPER_NODE_ID", _generate_stable_node_id())
 
 # Redis settings for central deduplication
-# Set REDIS_HOST environment variable to enable distributed mode
 REDIS_HOST = os.environ.get("REDIS_HOST", "")  # Empty = local mode
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
@@ -49,3 +56,6 @@ REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
 # Redis keys
 REDIS_SEEN_IDS_KEY = "scraper:seen_ids"
 REDIS_NODE_STATUS_KEY = "scraper:nodes"
+
+# Node timeout (seconds) - nodes not updated within this time are considered offline
+NODE_TIMEOUT = 60
