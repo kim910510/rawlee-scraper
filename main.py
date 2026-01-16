@@ -1,8 +1,3 @@
-"""
-Filovesk Scraper - Distributed Mode
-Supports both local and Redis-based central deduplication
-"""
-
 import asyncio
 import csv
 import json
@@ -18,7 +13,7 @@ import aiohttp
 
 # Redis support (optional)
 try:
-    import redis
+    import redis.asyncio as redis
     REDIS_AVAILABLE = True
 except ImportError:
     REDIS_AVAILABLE = False
@@ -45,13 +40,13 @@ logger = logging.getLogger(__name__)
 
 
 class RedisDedup:
-    """Redis-based central deduplication"""
+    """Redis-based central deduplication (Async)"""
     
     def __init__(self):
         self.client = None
         self.connected = False
         
-    def connect(self) -> bool:
+    async def connect(self) -> bool:
         if not REDIS_AVAILABLE or not REDIS_HOST:
             return False
         try:
@@ -63,7 +58,7 @@ class RedisDedup:
                 socket_timeout=5,
                 decode_responses=True
             )
-            self.client.ping()
+            await self.client.ping()
             self.connected = True
             logger.info(f"🔗 Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
             return True
@@ -72,45 +67,45 @@ class RedisDedup:
             self.connected = False
             return False
     
-    def is_seen(self, product_id: str) -> bool:
+    async def is_seen(self, product_id: str) -> bool:
         if not self.connected:
             return False
         try:
-            return self.client.sismember(REDIS_SEEN_IDS_KEY, product_id)
+            return await self.client.sismember(REDIS_SEEN_IDS_KEY, product_id)
         except:
             return False
     
-    def add_seen(self, product_id: str) -> bool:
+    async def add_seen(self, product_id: str) -> bool:
         if not self.connected:
             return False
         try:
-            return self.client.sadd(REDIS_SEEN_IDS_KEY, product_id) == 1
+            return await self.client.sadd(REDIS_SEEN_IDS_KEY, product_id) == 1
         except:
             return False
     
-    def add_seen_batch(self, product_ids: list) -> int:
+    async def add_seen_batch(self, product_ids: list) -> int:
         if not self.connected or not product_ids:
             return 0
         try:
-            return self.client.sadd(REDIS_SEEN_IDS_KEY, *product_ids)
+            return await self.client.sadd(REDIS_SEEN_IDS_KEY, *product_ids)
         except:
             return 0
     
-    def get_count(self) -> int:
+    async def get_count(self) -> int:
         if not self.connected:
             return 0
         try:
-            return self.client.scard(REDIS_SEEN_IDS_KEY)
+            return await self.client.scard(REDIS_SEEN_IDS_KEY)
         except:
             return 0
     
-    def update_node_status(self, stats: dict):
+    async def update_node_status(self, stats: dict):
         if not self.connected:
             return
         try:
             stats['last_update'] = time.time()
-            self.client.hset(REDIS_NODE_STATUS_KEY, NODE_ID, json.dumps(stats))
-            self.client.expire(REDIS_NODE_STATUS_KEY, 300)  # Expire if no update in 5 min
+            await self.client.hset(REDIS_NODE_STATUS_KEY, NODE_ID, json.dumps(stats))
+            await self.client.expire(REDIS_NODE_STATUS_KEY, 300)
         except:
             pass
 
@@ -148,7 +143,7 @@ class DistributedScraper:
         # Ensure directories exist
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def load_seen_ids(self):
+    async def load_seen_ids(self):
         """Load previously seen IDs from local file"""
         if self.seen_ids_file.exists():
             try:
@@ -160,22 +155,48 @@ class DistributedScraper:
                 logger.error(f"Error loading seen IDs: {e}")
         
         # Try to connect to Redis
-        if self.redis.connect():
+        if await self.redis.connect():
             self.use_redis = True
-            redis_count = self.redis.get_count()
+            redis_count = await self.redis.get_count()
             logger.info(f"🌐 Redis has {redis_count:,} total IDs across all nodes")
+            
+            # Sync local IDs to Redis for cross-node deduplication
+            if self.local_seen_ids:
+                await self.sync_local_to_redis()
 
-    def is_product_seen(self, product_id: str) -> bool:
-        """Check if product is seen (Redis first, then local)"""
+    async def sync_local_to_redis(self):
+        """Upload local IDs to Redis for complete cross-node deduplication"""
+        if not self.use_redis or not self.local_seen_ids:
+            return
+        
+        logger.info(f"📤 Syncing {len(self.local_seen_ids):,} local IDs to Redis...")
+        
+        # Batch upload in chunks of 1000
+        ids_list = list(self.local_seen_ids)
+        batch_size = 1000
+        synced = 0
+        
+        for i in range(0, len(ids_list), batch_size):
+            batch = ids_list[i:i+batch_size]
+            added = await self.redis.add_seen_batch(batch)
+            synced += added
+        
+        redis_count = await self.redis.get_count()
+        logger.info(f"✅ Synced to Redis! New: {synced:,}, Total in Redis: {redis_count:,}")
+
+    async def is_product_seen(self, product_id: str) -> bool:
+        """Check if product is seen (check local first, then Redis)"""
+        if product_id in self.local_seen_ids:
+            return True
         if self.use_redis:
-            return self.redis.is_seen(product_id)
-        return product_id in self.local_seen_ids
+            return await self.redis.is_seen(product_id)
+        return False
 
-    def mark_product_seen(self, product_id: str):
+    async def mark_product_seen(self, product_id: str):
         """Mark product as seen (both Redis and local)"""
         self.local_seen_ids.add(product_id)
         if self.use_redis:
-            self.redis.add_seen(product_id)
+            await self.redis.add_seen(product_id)
 
     def save_buffer(self):
         """Flush buffer to disk"""
@@ -278,8 +299,9 @@ class DistributedScraper:
                     new_count = 0
                     for p in products:
                         pid = str(p.get('id'))
-                        if pid and not self.is_product_seen(pid):
-                            self.mark_product_seen(pid)
+                        is_seen = await self.is_product_seen(pid)
+                        if pid and not is_seen:
+                            await self.mark_product_seen(pid)
                             transformed = transform_product(p)
                             self.products_buffer.append(transformed)
                             self.unique_products += 1
@@ -337,7 +359,7 @@ class DistributedScraper:
         print(f"   Auto-stop: when duplicate ratio > {MAX_DUPLICATE_RATIO*100:.0f}%")
         print("=" * 70)
         
-        self.load_seen_ids()
+        await self.load_seen_ids()
         
         if self.unique_products >= self.target:
             logger.info(f"✅ Target already reached: {self.unique_products:,} products")
@@ -357,7 +379,7 @@ class DistributedScraper:
                 
                 # Update Redis node status
                 if self.use_redis:
-                    self.redis.update_node_status(self.get_stats())
+                    await self.redis.update_node_status(self.get_stats())
                 
                 # Progress display
                 redis_indicator = "🌐" if self.use_redis else "💻"
