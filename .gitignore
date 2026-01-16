@@ -1,0 +1,11 @@
+# Crawlee Scraper Data
+data/
+*.csv
+*.log
+*.pyc
+__pycache__/
+.env
+*.egg-info/
+dist/
+build/
+.DS_Store
