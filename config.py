@@ -1,6 +1,8 @@
 """
-Crawlee Scraper Configuration - Optimized for Random API
+Crawlee Scraper Configuration - Distributed Mode
 """
+import os
+import uuid
 
 # Target API
 BASE_URL = "https://filovesk.click/api/item/type"
@@ -29,3 +31,21 @@ CSV_HEADERS = [
     "category_level1", "category_level2", "category_level3",
     "image_urls", "main_image", "created_at", "updated_at", "md5", "jump"
 ]
+
+# =============================================================================
+# DISTRIBUTED MODE SETTINGS
+# =============================================================================
+
+# Node identification (auto-generated if not set)
+NODE_ID = os.environ.get("SCRAPER_NODE_ID", f"node-{uuid.uuid4().hex[:8]}")
+
+# Redis settings for central deduplication
+# Set REDIS_HOST environment variable to enable distributed mode
+REDIS_HOST = os.environ.get("REDIS_HOST", "")  # Empty = local mode
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
+REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
+
+# Redis keys
+REDIS_SEEN_IDS_KEY = "scraper:seen_ids"
+REDIS_NODE_STATUS_KEY = "scraper:nodes"

@@ -1,30 +1,36 @@
 """
-Filovesk Scraper - Optimized for Random API
-Direct connection, high concurrency, smart deduplication
-Two-phase fetch: list API for IDs, info API for full details
+Filovesk Scraper - Distributed Mode
+Supports both local and Redis-based central deduplication
 """
 
 import asyncio
 import csv
+import json
 import logging
 import sys
 import time
 import argparse
 from pathlib import Path
-from typing import Set, List
+from typing import Set, Optional
 from collections import deque
 
 import aiohttp
 
+# Redis support (optional)
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
 from config import (
     BASE_URL, LIMIT_PER_PAGE, MAX_CONCURRENCY, BATCH_SIZE,
     REQUEST_TIMEOUT, MAX_DUPLICATE_RATIO, DUPLICATE_CHECK_WINDOW,
-    TARGET_UNIQUE, OUTPUT_FILE, SEEN_IDS_FILE, CSV_HEADERS, SAVE_INTERVAL
+    TARGET_UNIQUE, OUTPUT_FILE, SEEN_IDS_FILE, CSV_HEADERS, SAVE_INTERVAL,
+    NODE_ID, REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB,
+    REDIS_SEEN_IDS_KEY, REDIS_NODE_STATUS_KEY
 )
 from transform import transform_product
-
-# Info API for full product details (multiple images, tag/category, description)
-INFO_URL = "https://filovesk.click/api/item/info"
 
 # Setup logging
 logging.basicConfig(
@@ -38,18 +44,93 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class OptimizedScraper:
+class RedisDedup:
+    """Redis-based central deduplication"""
+    
+    def __init__(self):
+        self.client = None
+        self.connected = False
+        
+    def connect(self) -> bool:
+        if not REDIS_AVAILABLE or not REDIS_HOST:
+            return False
+        try:
+            self.client = redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                password=REDIS_PASSWORD if REDIS_PASSWORD else None,
+                db=REDIS_DB,
+                socket_timeout=5,
+                decode_responses=True
+            )
+            self.client.ping()
+            self.connected = True
+            logger.info(f"🔗 Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ Redis connection failed: {e} - using local mode")
+            self.connected = False
+            return False
+    
+    def is_seen(self, product_id: str) -> bool:
+        if not self.connected:
+            return False
+        try:
+            return self.client.sismember(REDIS_SEEN_IDS_KEY, product_id)
+        except:
+            return False
+    
+    def add_seen(self, product_id: str) -> bool:
+        if not self.connected:
+            return False
+        try:
+            return self.client.sadd(REDIS_SEEN_IDS_KEY, product_id) == 1
+        except:
+            return False
+    
+    def add_seen_batch(self, product_ids: list) -> int:
+        if not self.connected or not product_ids:
+            return 0
+        try:
+            return self.client.sadd(REDIS_SEEN_IDS_KEY, *product_ids)
+        except:
+            return 0
+    
+    def get_count(self) -> int:
+        if not self.connected:
+            return 0
+        try:
+            return self.client.scard(REDIS_SEEN_IDS_KEY)
+        except:
+            return 0
+    
+    def update_node_status(self, stats: dict):
+        if not self.connected:
+            return
+        try:
+            stats['last_update'] = time.time()
+            self.client.hset(REDIS_NODE_STATUS_KEY, NODE_ID, json.dumps(stats))
+            self.client.expire(REDIS_NODE_STATUS_KEY, 300)  # Expire if no update in 5 min
+        except:
+            pass
+
+
+class DistributedScraper:
     def __init__(self, target: int = None):
         self.output_file = Path(OUTPUT_FILE)
         self.seen_ids_file = Path(SEEN_IDS_FILE)
         
-        self.seen_ids: Set[str] = set()
+        self.local_seen_ids: Set[str] = set()
         self.products_buffer = []
         self.total_requests = 0
-        self.total_products = 0  # Products received from API
-        self.unique_products = 0  # Unique products saved
+        self.total_products = 0
+        self.unique_products = 0
         self.start_time = time.time()
         self.target = target or TARGET_UNIQUE
+        
+        # Redis deduplication
+        self.redis = RedisDedup()
+        self.use_redis = False
         
         # Duplicate tracking (sliding window)
         self.recent_results = deque(maxlen=DUPLICATE_CHECK_WINDOW)
@@ -58,25 +139,43 @@ class OptimizedScraper:
         self.current_batch_size = BATCH_SIZE
         self.min_batch_size = 10
         self.max_batch_size = BATCH_SIZE
-        self.response_times = deque(maxlen=50)  # Track last 50 response times
+        self.response_times = deque(maxlen=50)
         self.error_count = 0
         self.success_count = 0
-        self.throttle_threshold = 5.0  # Seconds - if avg response > this, reduce speed
-        self.error_threshold = 0.3  # If error rate > 30%, reduce speed
+        self.throttle_threshold = 5.0
+        self.error_threshold = 0.3
         
         # Ensure directories exist
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
 
     def load_seen_ids(self):
-        """Load previously seen IDs"""
+        """Load previously seen IDs from local file"""
         if self.seen_ids_file.exists():
             try:
                 with open(self.seen_ids_file, 'r') as f:
-                    self.seen_ids = set(line.strip() for line in f if line.strip())
-                self.unique_products = len(self.seen_ids)
-                logger.info(f"📂 Loaded {len(self.seen_ids):,} existing IDs")
+                    self.local_seen_ids = set(line.strip() for line in f if line.strip())
+                self.unique_products = len(self.local_seen_ids)
+                logger.info(f"📂 Loaded {len(self.local_seen_ids):,} local IDs")
             except Exception as e:
                 logger.error(f"Error loading seen IDs: {e}")
+        
+        # Try to connect to Redis
+        if self.redis.connect():
+            self.use_redis = True
+            redis_count = self.redis.get_count()
+            logger.info(f"🌐 Redis has {redis_count:,} total IDs across all nodes")
+
+    def is_product_seen(self, product_id: str) -> bool:
+        """Check if product is seen (Redis first, then local)"""
+        if self.use_redis:
+            return self.redis.is_seen(product_id)
+        return product_id in self.local_seen_ids
+
+    def mark_product_seen(self, product_id: str):
+        """Mark product as seen (both Redis and local)"""
+        self.local_seen_ids.add(product_id)
+        if self.use_redis:
+            self.redis.add_seen(product_id)
 
     def save_buffer(self):
         """Flush buffer to disk"""
@@ -92,7 +191,7 @@ class OptimizedScraper:
                     writer.writeheader()
                 writer.writerows(self.products_buffer)
             
-            # Append new IDs to seen file
+            # Append new IDs to local file
             with open(self.seen_ids_file, 'a') as f:
                 for p in self.products_buffer:
                     f.write(f"{p['id']}\n")
@@ -105,50 +204,41 @@ class OptimizedScraper:
             return 0
 
     def get_duplicate_ratio(self) -> float:
-        """Calculate recent duplicate ratio"""
         if len(self.recent_results) < 100:
             return 0.0
         duplicates = sum(self.recent_results)
         return duplicates / len(self.recent_results)
 
     def get_error_rate(self) -> float:
-        """Calculate recent error rate"""
         total = self.success_count + self.error_count
         if total < 10:
             return 0.0
         return self.error_count / total
 
     def get_avg_response_time(self) -> float:
-        """Get average response time from recent requests"""
         if not self.response_times:
             return 0.0
         return sum(self.response_times) / len(self.response_times)
 
     def adjust_rate(self):
-        """Dynamically adjust batch size based on API performance"""
         avg_time = self.get_avg_response_time()
         error_rate = self.get_error_rate()
         
-        # Throttle detection: slow response or high errors
         if avg_time > self.throttle_threshold or error_rate > self.error_threshold:
-            # Reduce batch size by 20%
             new_size = max(self.min_batch_size, int(self.current_batch_size * 0.8))
             if new_size < self.current_batch_size:
                 logger.info(f"\n⚠️ API throttling detected (resp: {avg_time:.1f}s, err: {error_rate*100:.0f}%) - reducing batch to {new_size}")
                 self.current_batch_size = new_size
         elif avg_time < 2.0 and error_rate < 0.1:
-            # Recovery: increase batch size by 10%
             new_size = min(self.max_batch_size, int(self.current_batch_size * 1.1))
             if new_size > self.current_batch_size:
                 self.current_batch_size = new_size
         
-        # Reset counters for next window
         if self.success_count + self.error_count > 100:
             self.success_count = 0
             self.error_count = 0
 
     async def fetch_batch(self, session: aiohttp.ClientSession) -> int:
-        """Fetch a batch of requests concurrently with adaptive sizing"""
         tasks = []
         for _ in range(self.current_batch_size):
             tasks.append(self.fetch_one(session))
@@ -160,13 +250,10 @@ class OptimizedScraper:
             if isinstance(result, int):
                 new_products += result
         
-        # Adjust rate based on performance
         self.adjust_rate()
-        
         return new_products
 
     async def fetch_one(self, session: aiohttp.ClientSession) -> int:
-        """Fetch one page and return number of new products (single-phase, faster)"""
         start_time = time.time()
         try:
             headers = {
@@ -191,15 +278,15 @@ class OptimizedScraper:
                     new_count = 0
                     for p in products:
                         pid = str(p.get('id'))
-                        if pid and pid not in self.seen_ids:
-                            self.seen_ids.add(pid)
+                        if pid and not self.is_product_seen(pid):
+                            self.mark_product_seen(pid)
                             transformed = transform_product(p)
                             self.products_buffer.append(transformed)
                             self.unique_products += 1
                             new_count += 1
-                            self.recent_results.append(0)  # Not a duplicate
+                            self.recent_results.append(0)
                         else:
-                            self.recent_results.append(1)  # Duplicate
+                            self.recent_results.append(1)
                     
                     return new_count
                 else:
@@ -211,14 +298,12 @@ class OptimizedScraper:
             return 0
 
     def format_time(self, seconds: float) -> str:
-        """Format seconds to HH:MM:SS"""
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
     def get_eta(self) -> str:
-        """Calculate ETA to target"""
         elapsed = time.time() - self.start_time
         if elapsed < 10 or self.unique_products == 0:
             return "--:--:--"
@@ -230,10 +315,23 @@ class OptimizedScraper:
             return self.format_time(eta_seconds)
         return "--:--:--"
 
+    def get_stats(self) -> dict:
+        elapsed = time.time() - self.start_time
+        return {
+            "node_id": NODE_ID,
+            "unique": self.unique_products,
+            "rate": self.unique_products / elapsed if elapsed > 0 else 0,
+            "dup_ratio": self.get_duplicate_ratio(),
+            "requests": self.total_requests,
+            "batch_size": self.current_batch_size,
+            "elapsed": elapsed
+        }
+
     async def run(self):
-        """Main scraping loop"""
+        mode = "🌐 Distributed (Redis)" if REDIS_HOST else "💻 Local"
         print("=" * 70)
-        print("🚀 Filovesk Scraper - Optimized for Random API")
+        print(f"🚀 Filovesk Scraper - {mode}")
+        print(f"   Node ID: {NODE_ID}")
         print(f"   Target: {self.target:,} unique products")
         print(f"   Concurrency: {BATCH_SIZE} requests/batch")
         print(f"   Auto-stop: when duplicate ratio > {MAX_DUPLICATE_RATIO*100:.0f}%")
@@ -248,20 +346,23 @@ class OptimizedScraper:
         connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY, limit_per_host=MAX_CONCURRENCY)
         
         async with aiohttp.ClientSession(connector=connector) as session:
-            batch_count = 0
             last_save_count = self.unique_products
             
             while self.unique_products < self.target:
-                batch_count += 1
-                new_products = await self.fetch_batch(session)
+                await self.fetch_batch(session)
                 
                 elapsed = time.time() - self.start_time
                 rate = self.unique_products / elapsed if elapsed > 0 else 0
                 dup_ratio = self.get_duplicate_ratio()
                 
+                # Update Redis node status
+                if self.use_redis:
+                    self.redis.update_node_status(self.get_stats())
+                
                 # Progress display
+                redis_indicator = "🌐" if self.use_redis else "💻"
                 sys.stdout.write(
-                    f"\r📦 Unique: {self.unique_products:,} | "
+                    f"\r{redis_indicator} [{NODE_ID}] Unique: {self.unique_products:,} | "
                     f"Rate: {rate:.1f}/s | "
                     f"Dup: {dup_ratio*100:.1f}% | "
                     f"Requests: {self.total_requests:,} | "
@@ -277,12 +378,11 @@ class OptimizedScraper:
                     if saved:
                         logger.info(f"\n💾 Saved {saved} products (total: {self.unique_products:,})")
                 
-                # Check auto-stop condition
+                # Check auto-stop
                 if dup_ratio >= MAX_DUPLICATE_RATIO and len(self.recent_results) >= DUPLICATE_CHECK_WINDOW:
                     print(f"\n\n⚠️ Auto-stopping: Duplicate ratio {dup_ratio*100:.1f}% exceeds threshold")
                     break
                 
-                # Small delay to avoid overwhelming the server
                 await asyncio.sleep(0.1)
         
         # Final save
@@ -294,6 +394,7 @@ class OptimizedScraper:
         print("\n")
         print("=" * 70)
         print("📊 SCRAPING COMPLETE")
+        print(f"   Node: {NODE_ID}")
         print(f"   Total Requests: {self.total_requests:,}")
         print(f"   Total Products Received: {self.total_products:,}")
         print(f"   Unique Products Saved: {self.unique_products:,}")
@@ -304,11 +405,11 @@ class OptimizedScraper:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Filovesk Product Scraper')
+    parser = argparse.ArgumentParser(description='Filovesk Product Scraper - Distributed Mode')
     parser.add_argument('--target', type=int, default=TARGET_UNIQUE,
                        help=f'Target number of unique products (default: {TARGET_UNIQUE:,})')
     parser.add_argument('--fresh', action='store_true',
-                       help='Start fresh (clear existing data)')
+                       help='Start fresh (clear LOCAL data only, not Redis)')
     args = parser.parse_args()
     
     if args.fresh:
@@ -318,9 +419,9 @@ def main():
             seen_file.unlink()
         if output_file.exists():
             output_file.unlink()
-        logger.info("🧹 Cleared existing data")
+        logger.info("🧹 Cleared local data")
     
-    scraper = OptimizedScraper(target=args.target)
+    scraper = DistributedScraper(target=args.target)
     
     try:
         asyncio.run(scraper.run())
