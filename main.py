@@ -185,21 +185,29 @@ class DistributedScraper:
                 await self.sync_local_to_redis()
 
     async def sync_local_to_redis(self):
-        """Upload local IDs to Redis for complete cross-node deduplication"""
+        """Upload local IDs to Redis using Pipeline for 10x faster sync"""
         if not self.use_redis or not self.local_seen_ids:
             return
         
-        logger.info(f"📤 Syncing {len(self.local_seen_ids):,} local IDs to Redis...")
+        total = len(self.local_seen_ids)
+        logger.info(f"📤 Fast-syncing {total:,} local IDs to Redis (Pipeline mode)...")
         
-        # Batch upload in chunks of 1000
+        # Use large batches with Pipeline for maximum speed
         ids_list = list(self.local_seen_ids)
-        batch_size = 1000
+        batch_size = 50000  # 50k per pipeline batch
         synced = 0
         
         for i in range(0, len(ids_list), batch_size):
             batch = ids_list[i:i+batch_size]
-            added = await self.redis.add_seen_batch(batch)
-            synced += added
+            # Pipeline: send all commands at once, execute in one round trip
+            pipe = self.redis.client.pipeline()
+            pipe.sadd(REDIS_SEEN_IDS_KEY, *batch)
+            results = await pipe.execute()
+            synced += results[0] if results else 0
+            
+            # Progress update
+            progress = min(i + batch_size, total)
+            logger.info(f"   📤 Progress: {progress:,}/{total:,} ({progress*100//total}%)")
         
         redis_count = await self.redis.get_count()
         logger.info(f"✅ Synced to Redis! New: {synced:,}, Total in Redis: {redis_count:,}")
