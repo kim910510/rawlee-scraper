@@ -55,7 +55,14 @@ def _generate_stable_node_id():
 NODE_ID = os.environ.get("SCRAPER_NODE_ID", _generate_stable_node_id())
 
 # Redis settings for central deduplication
-REDIS_HOST = os.environ.get("REDIS_HOST", "")  # Empty = local mode
+# ID Traversal Settings
+ID_INFO_URL = "https://filovesk.click/api/item/info" # GET parameter: id
+ID_RANGE_START = 2_700_000
+ID_RANGE_END = 115_000_000
+CHUNK_SIZE = 10_000 # IDs per work unit in Redis
+
+# Redis settings for central deduplication
+REDIS_HOST = os.environ.get("REDIS_HOST", "149.104.78.154")  # Default to verified Redis host
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
 REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
@@ -63,6 +70,7 @@ REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
 # Redis keys
 REDIS_SEEN_IDS_KEY = "scraper:seen_ids"
 REDIS_NODE_STATUS_KEY = "scraper:nodes"
+REDIS_QUEUE_KEY = "scraper:queue" # List of "start:end" strings
 
 # Node timeout (seconds) - nodes not updated within this time are considered offline
 NODE_TIMEOUT = 60

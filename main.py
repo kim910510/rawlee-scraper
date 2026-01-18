@@ -1,3 +1,4 @@
+
 import asyncio
 import csv
 import json
@@ -5,25 +6,28 @@ import logging
 import sys
 import time
 import argparse
+import random
 from pathlib import Path
-from typing import Set, Optional
+from typing import Set, List
 from collections import deque
 
 import aiohttp
 
-# Redis support (optional)
+# Redis support
 try:
     import redis.asyncio as redis
     REDIS_AVAILABLE = True
 except ImportError:
     REDIS_AVAILABLE = False
+    print("❌ Redis not installed. Run: pip install redis")
+    sys.exit(1)
 
 from config import (
-    BASE_URL, LIMIT_PER_PAGE, MAX_CONCURRENCY, BATCH_SIZE,
-    REQUEST_TIMEOUT, MAX_DUPLICATE_RATIO, DUPLICATE_CHECK_WINDOW,
-    TARGET_UNIQUE, OUTPUT_FILE, SEEN_IDS_FILE, CSV_HEADERS, SAVE_INTERVAL,
+    ID_INFO_URL, LIMIT_PER_PAGE, MAX_CONCURRENCY, BATCH_SIZE,
+    REQUEST_TIMEOUT, OUTPUT_FILE, SEEN_IDS_FILE, CSV_HEADERS, SAVE_INTERVAL,
     NODE_ID, REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB,
-    REDIS_SEEN_IDS_KEY, REDIS_NODE_STATUS_KEY
+    REDIS_SEEN_IDS_KEY, REDIS_NODE_STATUS_KEY, REDIS_QUEUE_KEY,
+    CHUNK_SIZE
 )
 from transform import transform_product
 
@@ -39,8 +43,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class RedisDedup:
-    """Redis-based central deduplication (Async)"""
+class RedisClient:
+    """Robust Redis Client with Auto-Reconnect"""
     
     def __init__(self):
         self.client = None
@@ -55,7 +59,8 @@ class RedisDedup:
                 port=REDIS_PORT,
                 password=REDIS_PASSWORD if REDIS_PASSWORD else None,
                 db=REDIS_DB,
-                socket_timeout=5,
+                socket_timeout=15,  # Increased timeout
+                socket_connect_timeout=15,
                 decode_responses=True
             )
             await self.client.ping()
@@ -63,173 +68,70 @@ class RedisDedup:
             logger.info(f"🔗 Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
             return True
         except Exception as e:
-            logger.warning(f"⚠️ Redis connection failed: {e} - using local mode")
+            logger.warning(f"⚠️ Redis connection failed: {e}")
             self.connected = False
             return False
     
-    async def is_seen(self, product_id: str) -> bool:
+    async def ensure_connection(self):
         if not self.connected:
-            await self._try_reconnect()
-        if not self.connected:
-            return False
-        try:
-            return await self.client.sismember(REDIS_SEEN_IDS_KEY, product_id)
-        except Exception:
-            await self._try_reconnect()
-            return False
+            await self.connect()
+        # Ping occasionally? No, assume connection is good or restart loop will handle it
     
-    async def add_seen(self, product_id: str) -> bool:
+    async def pop_chunk(self) -> str:
+        await self.ensure_connection()
         if not self.connected:
-            await self._try_reconnect()
+            return None
+        try:
+            # LPOP returns element or None
+            return await self.client.lpop(REDIS_QUEUE_KEY)
+        except Exception:
+            self.connected = False
+            return None
+
+    async def push_chunk(self, chunk: str):
+        """Push chunk back to queue (if failed)"""
+        await self.ensure_connection()
         if not self.connected:
-            return False
+            return
         try:
-            return await self.client.sadd(REDIS_SEEN_IDS_KEY, product_id) == 1
+            await self.client.rpush(REDIS_QUEUE_KEY, chunk)
         except Exception:
-            await self._try_reconnect()
-            return False
-    
-    async def add_seen_batch(self, product_ids: list) -> int:
-        if not self.connected or not product_ids:
-            return 0
-        try:
-            return await self.client.sadd(REDIS_SEEN_IDS_KEY, *product_ids)
-        except Exception:
-            await self._try_reconnect()
-            return 0
-    
-    async def get_count(self) -> int:
-        if not self.connected:
-            return 0
-        try:
-            return await self.client.scard(REDIS_SEEN_IDS_KEY)
-        except Exception:
-            await self._try_reconnect()
-            return 0
-    
+            self.connected = False
+
     async def update_node_status(self, stats: dict):
-        if not self.connected:
-            await self._try_reconnect()
+        await self.ensure_connection()
         if not self.connected:
             return
         try:
             stats['last_update'] = time.time()
-            await self.client.hset(REDIS_NODE_STATUS_KEY, NODE_ID, json.dumps(stats))
+            data = json.dumps(stats)
+            await self.client.hset(REDIS_NODE_STATUS_KEY, NODE_ID, data)
             await self.client.expire(REDIS_NODE_STATUS_KEY, 300)
         except Exception:
-            await self._try_reconnect()
-    
-    async def _try_reconnect(self):
-        """Try to reconnect to Redis if disconnected"""
-        if self.connected:
-            return
-        try:
-            logger.info("🔄 Attempting Redis reconnection...")
-            await self.connect()
-        except:
-            pass
+            self.connected = False
 
 
-class DistributedScraper:
-    def __init__(self, target: int = None):
+class IDTraversalScraper:
+    def __init__(self):
         self.output_file = Path(OUTPUT_FILE)
         self.seen_ids_file = Path(SEEN_IDS_FILE)
         
-        self.local_seen_ids: Set[str] = set()
         self.products_buffer = []
         self.total_requests = 0
         self.total_products = 0
-        self.unique_products = 0
         self.start_time = time.time()
-        self.target = target or TARGET_UNIQUE
         
-        # Redis deduplication
-        self.redis = RedisDedup()
-        self.use_redis = False
-        
-        # Duplicate tracking (sliding window)
-        self.recent_results = deque(maxlen=DUPLICATE_CHECK_WINDOW)
-        
-        # Adaptive rate limiting
-        self.current_batch_size = BATCH_SIZE
-        self.min_batch_size = 10
-        self.max_batch_size = BATCH_SIZE
-        self.response_times = deque(maxlen=50)
-        self.error_count = 0
-        self.success_count = 0
-        self.throttle_threshold = 5.0
-        self.error_threshold = 0.3
+        self.redis = RedisClient()
+        self.current_chunk = None
+        self.chunk_progress = 0
         
         # Ensure directories exist
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    async def load_seen_ids(self):
-        """Load previously seen IDs from local file"""
-        if self.seen_ids_file.exists():
-            try:
-                with open(self.seen_ids_file, 'r') as f:
-                    self.local_seen_ids = set(line.strip() for line in f if line.strip())
-                self.unique_products = len(self.local_seen_ids)
-                logger.info(f"📂 Loaded {len(self.local_seen_ids):,} local IDs")
-            except Exception as e:
-                logger.error(f"Error loading seen IDs: {e}")
-        
-        # Try to connect to Redis
-        if await self.redis.connect():
-            self.use_redis = True
-            redis_count = await self.redis.get_count()
-            logger.info(f"🌐 Redis has {redis_count:,} total IDs across all nodes")
-            
-            # Sync local IDs to Redis for cross-node deduplication
-            if self.local_seen_ids:
-                await self.sync_local_to_redis()
-
-    async def sync_local_to_redis(self):
-        """Upload local IDs to Redis using Pipeline for 10x faster sync"""
-        if not self.use_redis or not self.local_seen_ids:
-            return
-        
-        total = len(self.local_seen_ids)
-        logger.info(f"📤 Fast-syncing {total:,} local IDs to Redis (Pipeline mode)...")
-        
-        # Use large batches with Pipeline for maximum speed
-        ids_list = list(self.local_seen_ids)
-        batch_size = 50000  # 50k per pipeline batch
-        synced = 0
-        
-        for i in range(0, len(ids_list), batch_size):
-            batch = ids_list[i:i+batch_size]
-            # Pipeline: send all commands at once, execute in one round trip
-            pipe = self.redis.client.pipeline()
-            pipe.sadd(REDIS_SEEN_IDS_KEY, *batch)
-            results = await pipe.execute()
-            synced += results[0] if results else 0
-            
-            # Progress update
-            progress = min(i + batch_size, total)
-            logger.info(f"   📤 Progress: {progress:,}/{total:,} ({progress*100//total}%)")
-        
-        redis_count = await self.redis.get_count()
-        logger.info(f"✅ Synced to Redis! New: {synced:,}, Total in Redis: {redis_count:,}")
-
-    async def is_product_seen(self, product_id: str) -> bool:
-        """Check if product is seen (check local first, then Redis)"""
-        if product_id in self.local_seen_ids:
-            return True
-        if self.use_redis:
-            return await self.redis.is_seen(product_id)
-        return False
-
-    async def mark_product_seen(self, product_id: str):
-        """Mark product as seen (both Redis and local)"""
-        self.local_seen_ids.add(product_id)
-        if self.use_redis:
-            await self.redis.add_seen(product_id)
-
     def save_buffer(self):
         """Flush buffer to disk"""
         if not self.products_buffer:
-            return
+            return 0
 
         try:
             write_header = not self.output_file.exists() or self.output_file.stat().st_size == 0
@@ -240,111 +142,11 @@ class DistributedScraper:
                     writer.writeheader()
                 writer.writerows(self.products_buffer)
             
-            # Append new IDs to local file
-            with open(self.seen_ids_file, 'a') as f:
-                for p in self.products_buffer:
-                    f.write(f"{p['id']}\n")
-            
-            saved_count = len(self.products_buffer)
+            count = len(self.products_buffer)
             self.products_buffer = []
-            return saved_count
+            return count
         except Exception as e:
             logger.error(f"Error saving buffer: {e}")
-            return 0
-
-    def get_duplicate_ratio(self) -> float:
-        if len(self.recent_results) < 100:
-            return 0.0
-        duplicates = sum(self.recent_results)
-        return duplicates / len(self.recent_results)
-
-    def get_error_rate(self) -> float:
-        total = self.success_count + self.error_count
-        if total < 10:
-            return 0.0
-        return self.error_count / total
-
-    def get_avg_response_time(self) -> float:
-        if not self.response_times:
-            return 0.0
-        return sum(self.response_times) / len(self.response_times)
-
-    def adjust_rate(self):
-        avg_time = self.get_avg_response_time()
-        error_rate = self.get_error_rate()
-        
-        if avg_time > self.throttle_threshold or error_rate > self.error_threshold:
-            new_size = max(self.min_batch_size, int(self.current_batch_size * 0.8))
-            if new_size < self.current_batch_size:
-                logger.info(f"\n⚠️ API throttling detected (resp: {avg_time:.1f}s, err: {error_rate*100:.0f}%) - reducing batch to {new_size}")
-                self.current_batch_size = new_size
-        elif avg_time < 2.0 and error_rate < 0.1:
-            new_size = min(self.max_batch_size, int(self.current_batch_size * 1.1))
-            if new_size > self.current_batch_size:
-                self.current_batch_size = new_size
-        
-        if self.success_count + self.error_count > 100:
-            self.success_count = 0
-            self.error_count = 0
-
-    async def fetch_batch(self, session: aiohttp.ClientSession) -> int:
-        tasks = []
-        for _ in range(self.current_batch_size):
-            tasks.append(self.fetch_one(session))
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        new_products = 0
-        for result in results:
-            if isinstance(result, int):
-                new_products += result
-        
-        self.adjust_rate()
-        return new_products
-
-    async def fetch_one(self, session: aiohttp.ClientSession) -> int:
-        start_time = time.time()
-        try:
-            headers = {
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0 Safari/537.36",
-            }
-            payload = {"page": 1, "limit": LIMIT_PER_PAGE}
-            
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            async with session.post(BASE_URL, json=payload, headers=headers, timeout=timeout) as response:
-                elapsed = time.time() - start_time
-                self.response_times.append(elapsed)
-                
-                if response.status == 200:
-                    data = await response.json()
-                    products = data.get('data', {}).get('data', [])
-                    
-                    self.total_requests += 1
-                    self.total_products += len(products)
-                    self.success_count += 1
-                    
-                    new_count = 0
-                    for p in products:
-                        pid = str(p.get('id'))
-                        is_seen = await self.is_product_seen(pid)
-                        if pid and not is_seen:
-                            await self.mark_product_seen(pid)
-                            transformed = transform_product(p)
-                            self.products_buffer.append(transformed)
-                            self.unique_products += 1
-                            new_count += 1
-                            self.recent_results.append(0)
-                        else:
-                            self.recent_results.append(1)
-                    
-                    return new_count
-                else:
-                    self.error_count += 1
-                    return 0
-        except Exception as e:
-            self.error_count += 1
-            self.response_times.append(REQUEST_TIMEOUT)
             return 0
 
     def format_time(self, seconds: float) -> str:
@@ -353,134 +155,183 @@ class DistributedScraper:
         secs = int(seconds % 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-    def get_eta(self) -> str:
-        elapsed = time.time() - self.start_time
-        if elapsed < 10 or self.unique_products == 0:
-            return "--:--:--"
-        
-        rate = self.unique_products / elapsed
-        remaining = self.target - self.unique_products
-        if rate > 0 and remaining > 0:
-            eta_seconds = remaining / rate
-            return self.format_time(eta_seconds)
-        return "--:--:--"
-
     def get_stats(self) -> dict:
         elapsed = time.time() - self.start_time
         return {
             "node_id": NODE_ID,
-            "unique": self.unique_products,
-            "rate": self.unique_products / elapsed if elapsed > 0 else 0,
-            "dup_ratio": self.get_duplicate_ratio(),
+            "products": self.total_products,
+            "rate": self.total_products / elapsed if elapsed > 0 else 0,
+            "current_chunk": self.current_chunk,
             "requests": self.total_requests,
-            "batch_size": self.current_batch_size,
             "elapsed": elapsed
         }
 
-    async def run(self):
-        mode = "🌐 Distributed (Redis)" if REDIS_HOST else "💻 Local"
+    async def process_chunk(self, session: aiohttp.ClientSession, chunk: str) -> bool:
+        try:
+            start_id, end_id = map(int, chunk.split(':'))
+        except ValueError:
+            logger.error(f"Invalid chunk format: {chunk}")
+            return True # Discard invalid chunk
+
+        total_ids = end_id - start_id
+        logger.info(f"📥 Processing chunk {chunk} ({total_ids} IDs)...")
+        
+        # Create tasks for all IDs in chunk
+        # Process in batches to control concurrency within the chunk
+        
+        chunk_tasks = []
+        for product_id in range(start_id, end_id):
+            chunk_tasks.append(self.fetch_id(session, product_id))
+            
+            # If buffer gets too big, await some tasks
+            if len(chunk_tasks) >= MAX_CONCURRENCY:
+                await self._gather_tasks(chunk_tasks)
+                chunk_tasks = []
+
+        # Remaining tasks
+        if chunk_tasks:
+            await self._gather_tasks(chunk_tasks)
+            
+        return True
+
+    async def _gather_tasks(self, tasks):
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Update redis status regularly
+        await self.redis.update_node_status(self.get_stats())
+        
+        # Periodic save
+        if len(self.products_buffer) >= SAVE_INTERVAL:
+            saved = self.save_buffer()
+            if saved:
+                logger.info(f"💾 Saved {saved} items")
+
+    async def fetch_id(self, session: aiohttp.ClientSession, product_id: int):
+        self.total_requests += 1
+        url = f"{ID_INFO_URL}?id={product_id}"
+        
+        try:
+            async with session.get(url, timeout=REQUEST_TIMEOUT) as response:
+                if response.status == 200:
+                    try:
+                        data = await response.json()
+                        # Check API code
+                        if data.get('code') == 200 and 'data' in data:
+                            product_data = data['data']
+                            # Enforce ID match (API might return related products or mismatch)
+                            # Actually info API returns a single object in 'data' usually, 
+                            # but let's double check structure. 
+                            # Based on curl output: {"code":200,"data":{"attr":[],...}}
+                            
+                            # Inject ID because it might be missing in data body 
+                            # (wait, earlier curl response didn't show ID in data body explicitly? 
+                            #  Ah, curl output: `{"code":200,"data":{"attr":[],"category":"...","name":...}`)
+                            # We need to inject the ID we requested.
+                            product_data['id'] = product_id
+                            
+                            transformed = transform_product(product_data)
+                            self.products_buffer.append(transformed)
+                            self.total_products += 1
+                            return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return False
+
+    async def run(self, manual_range: tuple = None):
         print("=" * 70)
+        mode = "🌐 Distributed (Redis)" if not manual_range else "🔧 Manual Range"
         print(f"🚀 Filovesk Scraper - {mode}")
         print(f"   Node ID: {NODE_ID}")
-        print(f"   Target: {self.target:,} unique products")
-        print(f"   Concurrency: {BATCH_SIZE} requests/batch")
-        print(f"   Auto-stop: when duplicate ratio > {MAX_DUPLICATE_RATIO*100:.0f}%")
+        if manual_range:
+            print(f"   Manual Range: {manual_range[0]} - {manual_range[1]}")
+        else:
+            print(f"   Redis: {REDIS_HOST}")
         print("=" * 70)
+
+        use_redis = False
+        if not manual_range:
+            if not await self.redis.connect():
+                print("❌ Cannot start without Redis connection (unless using --range)!")
+                return
+            use_redis = True
         
-        await self.load_seen_ids()
-        
-        if self.unique_products >= self.target:
-            logger.info(f"✅ Target already reached: {self.unique_products:,} products")
-            return
-        
-        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY, limit_per_host=MAX_CONCURRENCY)
+        # Disable SSL verification for slightly faster connection/less issues if needed (or keep default)
+        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY, limit_per_host=MAX_CONCURRENCY, ssl=False)
         
         async with aiohttp.ClientSession(connector=connector) as session:
-            last_save_count = self.unique_products
-            
-            while self.unique_products < self.target:
-                await self.fetch_batch(session)
+            # Manual Range Mode
+            if manual_range:
+                start, end = manual_range
+                for chunk_start in range(start, end, CHUNK_SIZE):
+                    chunk_end = min(chunk_start + CHUNK_SIZE, end)
+                    chunk = f"{chunk_start}:{chunk_end}"
+                    
+                    try:
+                        chunk_start_time = time.time()
+                        await self.process_chunk(session, chunk)
+                        elapsed = time.time() - chunk_start_time
+                        rate = CHUNK_SIZE / elapsed
+                        print(f"✅ Chunk {chunk} done in {elapsed:.1f}s ({rate:.1f} IDs/s)")
+                    except KeyboardInterrupt:
+                        self.save_buffer()
+                        raise
+                    except Exception as e:
+                        logger.error(f"Error processing chunk {chunk}: {e}")
                 
-                elapsed = time.time() - self.start_time
-                rate = self.unique_products / elapsed if elapsed > 0 else 0
-                dup_ratio = self.get_duplicate_ratio()
-                
-                # Update Redis node status
-                if self.use_redis:
-                    await self.redis.update_node_status(self.get_stats())
-                
-                # Progress display
-                redis_indicator = "🌐" if self.use_redis else "💻"
-                sys.stdout.write(
-                    f"\r{redis_indicator} [{NODE_ID}] Unique: {self.unique_products:,} | "
-                    f"Rate: {rate:.1f}/s | "
-                    f"Dup: {dup_ratio*100:.1f}% | "
-                    f"Requests: {self.total_requests:,} | "
-                    f"ETA: {self.get_eta()} | "
-                    f"Elapsed: {self.format_time(elapsed)}"
-                )
-                sys.stdout.flush()
-                
-                # Periodic save
-                if self.unique_products - last_save_count >= SAVE_INTERVAL:
-                    saved = self.save_buffer()
-                    last_save_count = self.unique_products
-                    if saved:
-                        logger.info(f"\n💾 Saved {saved} products (total: {self.unique_products:,})")
-                
-                # Check auto-stop
-                if dup_ratio >= MAX_DUPLICATE_RATIO and len(self.recent_results) >= DUPLICATE_CHECK_WINDOW:
-                    print(f"\n\n⚠️ Auto-stopping: Duplicate ratio {dup_ratio*100:.1f}% exceeds threshold")
-                    break
-                
-                await asyncio.sleep(0.1)
-        
-        # Final save
-        if self.products_buffer:
-            self.save_buffer()
-        
-        # Summary
-        elapsed = time.time() - self.start_time
-        print("\n")
-        print("=" * 70)
-        print("📊 SCRAPING COMPLETE")
-        print(f"   Node: {NODE_ID}")
-        print(f"   Total Requests: {self.total_requests:,}")
-        print(f"   Total Products Received: {self.total_products:,}")
-        print(f"   Unique Products Saved: {self.unique_products:,}")
-        print(f"   Final Duplicate Ratio: {self.get_duplicate_ratio()*100:.1f}%")
-        print(f"   Elapsed Time: {self.format_time(elapsed)}")
-        print(f"   Average Rate: {self.unique_products/elapsed:.1f} products/s")
-        print("=" * 70)
+            # Redis Distributed Mode
+            else:
+                while True:
+                    chunk = await self.redis.pop_chunk()
+                    
+                    if not chunk:
+                        print("💤 Queue empty. Waiting 10s...")
+                        await asyncio.sleep(10)
+                        chunk = await self.redis.pop_chunk()
+                        if not chunk:
+                            print("🎉 No more chunks! Scraper finished.")
+                            break
+                    
+                    self.current_chunk = chunk
+                    start_time = time.time()
+                    
+                    try:
+                        success = await self.process_chunk(session, chunk)
+                        
+                        elapsed = time.time() - start_time
+                        rate = CHUNK_SIZE / elapsed
+                        print(f"✅ Chunk {chunk} done in {elapsed:.1f}s ({rate:.1f} IDs/s)")
+                        
+                    except KeyboardInterrupt:
+                        print(f"\n⚠️ Interrupted! Returning chunk {chunk} to queue...")
+                        await self.redis.push_chunk(chunk)
+                        raise
+                    except Exception as e:
+                        logger.error(f"Error processing chunk {chunk}: {e}")
 
+        self.save_buffer()
+        print("\n🏁 Session ended.")
 
 def main():
-    parser = argparse.ArgumentParser(description='Filovesk Product Scraper - Distributed Mode')
-    parser.add_argument('--target', type=int, default=TARGET_UNIQUE,
-                       help=f'Target number of unique products (default: {TARGET_UNIQUE:,})')
-    parser.add_argument('--fresh', action='store_true',
-                       help='Start fresh (clear LOCAL data only, not Redis)')
+    parser = argparse.ArgumentParser(description='Filovesk ID Traversal Scraper')
+    parser.add_argument('--range', type=str, help='Manual ID range (e.g. 1000000:2000000) to bypass Redis')
     args = parser.parse_args()
-    
-    if args.fresh:
-        seen_file = Path(SEEN_IDS_FILE)
-        output_file = Path(OUTPUT_FILE)
-        if seen_file.exists():
-            seen_file.unlink()
-        if output_file.exists():
-            output_file.unlink()
-        logger.info("🧹 Cleared local data")
-    
-    scraper = DistributedScraper(target=args.target)
-    
-    try:
-        asyncio.run(scraper.run())
-    except KeyboardInterrupt:
-        print("\n\n🛑 Stopped by user")
-        if scraper.products_buffer:
-            scraper.save_buffer()
-            print(f"💾 Saved {len(scraper.products_buffer)} products before exit")
 
+    manual_range = None
+    if args.range:
+        try:
+            start, end = map(int, args.range.split(':'))
+            manual_range = (start, end)
+        except ValueError:
+            print("❌ Invalid range format. Use START:END (e.g. 1000000:2000000)")
+            return
+
+    scraper = IDTraversalScraper()
+    try:
+        asyncio.run(scraper.run(manual_range))
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped by user")
+        scraper.save_buffer()
 
 if __name__ == "__main__":
     main()
